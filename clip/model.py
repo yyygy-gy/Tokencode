@@ -321,6 +321,98 @@ class ResidualAttentionBlock_HiCroPL(nn.Module):
         return [x, cross_prompts_deeper]
 
 
+class ResidualAttentionBlock_TokenMod(nn.Module):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None,
+                 text_layer=False, i=0, design_details=None):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.ln_2 = LayerNorm(d_model)
+        self.text_layer = text_layer
+        self.attn_mask = attn_mask
+        self.i = i
+        self.n_head = n_head
+
+    def attention(self, x: torch.Tensor, extra_mask=None):
+        # Custom attention keeps additive bias in the autograd graph and avoids
+        # SDPA mask-alignment issues with broadcasted float masks.
+        L, N, C = x.shape
+        head_dim = C // self.n_head
+
+        qkv = F.linear(x, self.attn.in_proj_weight, self.attn.in_proj_bias)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.contiguous().view(L, N * self.n_head, head_dim).transpose(0, 1)
+        k = k.contiguous().view(L, N * self.n_head, head_dim).transpose(0, 1)
+        v = v.contiguous().view(L, N * self.n_head, head_dim).transpose(0, 1)
+
+        scale = float(head_dim) ** -0.5
+        attn = torch.baddbmm(
+            torch.empty(q.shape[0], L, L, dtype=q.dtype, device=q.device),
+            q, k.transpose(-2, -1),
+            beta=0, alpha=scale,
+        )
+
+        if self.attn_mask is not None:
+            causal = self.attn_mask.to(dtype=attn.dtype, device=attn.device)
+            attn = attn + causal
+        if extra_mask is not None:
+            extra_mask = extra_mask.to(dtype=attn.dtype, device=attn.device)
+            if extra_mask.dim() == 2:
+                attn = attn + extra_mask
+            elif extra_mask.dim() == 3:
+                if extra_mask.shape[0] == self.n_head:
+                    extra_mask = extra_mask.repeat(N, 1, 1)
+                attn = attn + extra_mask
+            else:
+                raise ValueError(f"Unexpected extra_mask shape: {tuple(extra_mask.shape)}")
+
+        attn = attn.softmax(dim=-1)
+        out = torch.bmm(attn, v)
+        out = out.transpose(0, 1).contiguous().view(L, N, C)
+        out = F.linear(out, self.attn.out_proj.weight, self.attn.out_proj.bias)
+        return out
+
+    def forward(self, inputs):
+        # Vision: [x, visual_codes, visual_modulators, pos_embed]
+        # Text:   [x, text_codes, text_modulators, token_masks]
+        x = inputs[0]
+        codes = inputs[1]
+        modulators = inputs[2]
+        aux = inputs[3]
+
+        extra_mask = None
+        if codes is not None and modulators is not None and self.i < len(codes):
+            code = codes[self.i]
+            modulator = modulators[self.i]
+            mode = getattr(modulator, "mode", "attn_bias")
+            if mode == "film":
+                # FiLM modulates features before attention; no extra attn bias.
+                if self.text_layer:
+                    x = modulator(code, x, token_masks=aux)
+                else:
+                    x = modulator(code, x)
+            else:
+                if self.text_layer:
+                    extra_mask = modulator(code, aux, self.n_head)
+                else:
+                    extra_mask = modulator(code, aux, self.n_head, seq_len=x.shape[0])
+                    batch = x.shape[1]
+                    if extra_mask.dim() == 3 and extra_mask.shape[0] == self.n_head:
+                        extra_mask = extra_mask.unsqueeze(0).expand(batch, -1, -1, -1).reshape(
+                            batch * self.n_head, x.shape[0], x.shape[0]
+                        ).contiguous()
+
+        x = x + self.attention(self.ln_1(x), extra_mask=extra_mask)
+        x = x + self.mlp(self.ln_2(x))
+        return [x, codes, modulators, aux]
+
+
 class ResidualAttentionBlock_MaPLe(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, design_details=None,
                  text_layer=False, i=0):
@@ -423,6 +515,13 @@ class Transformer(nn.Module):
                                              else ResidualAttentionBlock_HiCroPL(width, heads, attn_mask, False,
                                                                               text_layer, i, design_details)
                                              for i in range(layers)])
+        elif current_trainer == 'TokenModHiCroPL':
+            self.resblocks = nn.Sequential(*[
+                ResidualAttentionBlock_TokenMod(
+                    width, heads, attn_mask, text_layer, i, design_details
+                )
+                for i in range(layers)
+            ])
         else:
             # Corresponds to default CoOp or CoCoOp
             assert current_trainer == 'CoOp' or current_trainer == 'CoCoOp'
@@ -551,6 +650,55 @@ class VisionTransformer_HiCroPL(nn.Module):
         return x
 
 
+class VisionTransformer_TokenMod(nn.Module):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int,
+                 output_dim: int, design_details):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.ln_pre = LayerNorm(width)
+        self.prompt_till_layer_visual = design_details["vision_depth"]
+        self.transformer = Transformer(
+            width,
+            layers,
+            heads,
+            prompts_needed=self.prompt_till_layer_visual,
+            design_details=design_details,
+        )
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+    def forward(self, x: torch.Tensor, visual_codes, visual_modulators):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat(
+            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+
+        # Token modulation never inserts prompt tokens.
+        assert x.shape[1] == self.positional_embedding.shape[0]
+        assert x.shape[1] == 197, f"TokenMod visual seq_len must be 197, got {x.shape[1]}"
+
+        x = self.ln_pre(x)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        outputs = self.transformer([x, visual_codes, visual_modulators, self.positional_embedding])
+        x = outputs[0]
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        x = self.ln_post(x[:, 0, :])
+
+        if self.proj is not None:
+            x = x @ self.proj
+
+        return x
+
+
 class VisionTransformer_MaPLe(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,
                  design_details):
@@ -649,6 +797,16 @@ class CLIP(nn.Module):
                 )
             elif trainer == "HiCroPL":
                 self.visual = VisionTransformer_HiCroPL(
+                    input_resolution=image_resolution,
+                    patch_size=vision_patch_size,
+                    width=vision_width,
+                    layers=vision_layers,
+                    heads=vision_heads,
+                    output_dim=embed_dim,
+                    design_details=design_details,
+                )
+            elif trainer == "TokenModHiCroPL":
+                self.visual = VisionTransformer_TokenMod(
                     input_resolution=image_resolution,
                     patch_size=vision_patch_size,
                     width=vision_width,
@@ -833,3 +991,4 @@ def build_model(state_dict: dict, design_details):
         missing_keys, _ = model.load_state_dict(state_dict, strict=False)
         print('Weights not found for some missing keys: ', missing_keys)
     return model.eval()
+

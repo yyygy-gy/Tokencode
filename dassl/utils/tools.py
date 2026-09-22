@@ -125,9 +125,11 @@ def collect_env_info():
 
     Code source: github.com/facebookresearch/maskrcnn-benchmark
     """
-    from torch.utils.collect_env import get_pretty_env_info
-
-    env_str = get_pretty_env_info()
+    try:
+        from torch.utils.collect_env import get_pretty_env_info
+        env_str = get_pretty_env_info()
+    except Exception as e:
+        env_str = "Failed to collect detailed env info: {}".format(e)
     env_str += "\n        Pillow ({})".format(PIL.__version__)
     return env_str
 

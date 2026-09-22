@@ -29,6 +29,7 @@ import trainers.maple
 import trainers.independentVL
 import trainers.promptsrc
 import trainers.hicropl
+import trainers.token_mod_hicropl
 
 def print_args(args, cfg):
     print("***************")
@@ -144,6 +145,27 @@ def extend_cfg(cfg):
     cfg.TRAINER.HICROPL.TEACHER_NAME = "ViT-L/14"
     cfg.TRAINER.HICROPL.LAMBD = 10.
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+
+    # Config for TokenModHiCroPL
+    cfg.TRAINER.TOKENMOD = CN()
+    cfg.TRAINER.TOKENMOD.N_CTX = 16          # compatibility only; never used for insertion
+    cfg.TRAINER.TOKENMOD.CROSS_LAYER = 6
+    cfg.TRAINER.TOKENMOD.CTX_INIT = "a photo of a"
+    cfg.TRAINER.TOKENMOD.PREC = "fp16"
+    cfg.TRAINER.TOKENMOD.PROMPT_DEPTH = 12
+    cfg.TRAINER.TOKENMOD.TEACHER_NAME = "ViT-B/16"
+    cfg.TRAINER.TOKENMOD.LAMBD = 12.
+    cfg.TRAINER.TOKENMOD.CODE_LEN = 16
+    cfg.TRAINER.TOKENMOD.RANK = 8
+    cfg.TRAINER.TOKENMOD.MODULATION = "attn_bias"  # attn_bias | film
+    cfg.TRAINER.TOKENMOD.BIAS_SCALE = 5.0
+    cfg.TRAINER.TOKENMOD.USE_RESIDUAL = True
+    cfg.TRAINER.TOKENMOD.USE_DISTILL = True
+    cfg.TRAINER.TOKENMOD.RESIDUAL_GATE = True
+    cfg.TRAINER.TOKENMOD.RESIDUAL_GATE_INIT = 0.1
+    # Keep unconditional FiLM (global codes) as the default film path.
+    # Conditional code generators are an explicit opt-in for cond-FiLM runs.
+    cfg.TRAINER.TOKENMOD.USE_CONDITIONAL_CODES = False
 
 
 def setup_cfg(args):
