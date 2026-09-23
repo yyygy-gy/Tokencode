@@ -145,16 +145,31 @@ def main() -> None:
                 / args.cfg
                 / run_tag
             )
+            train_dir = train_root / common
+            test_dir = test_root / common
+
+            # Dassl sometimes rotates logs to log.txt-YYYY-MM-DD-HH-MM-SS
+            if train_dir.is_dir():
+                rotated = sorted(train_dir.glob("log.txt*"), reverse=True)
+                base_candidates.extend(rotated)
+            else:
+                base_candidates.append(train_dir / "log.txt")
+
             base_candidates.extend(
                 [
-                    train_root / common / "log.txt",
                     log_root / f"{name}_{run_tag}_train.out.txt",
                     log_root / f"{name}_{run_tag}.out.txt",
                 ]
             )
+
+            if test_dir.is_dir():
+                rotated = sorted(test_dir.glob("log.txt*"), reverse=True)
+                novel_candidates.extend(rotated)
+            else:
+                novel_candidates.append(test_dir / "log.txt")
+
             novel_candidates.extend(
                 [
-                    test_root / common / "log.txt",
                     log_root / f"{name}_{run_tag}_novel.out.txt",
                 ]
             )
