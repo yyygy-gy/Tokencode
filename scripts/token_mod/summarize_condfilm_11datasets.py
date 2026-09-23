@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional CSV output path",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print resolved log paths for incomplete datasets",
+    )
     return parser.parse_args()
 
 
@@ -94,6 +99,20 @@ def first_existing(paths):
         if path.is_file():
             return path
     return None
+
+
+def first_with_accuracy(paths):
+    """Prefer a readable log that actually contains a parseable accuracy."""
+    fallback = None
+    for path in paths:
+        if not path.is_file():
+            continue
+        if fallback is None:
+            fallback = path
+        acc = extract_test_accuracy(read_text(path))
+        if acc is not None:
+            return path, acc
+    return fallback, None
 
 
 def fmt(value: Optional[float]) -> str:
@@ -140,11 +159,8 @@ def main() -> None:
                 ]
             )
 
-        base_path = first_existing(base_candidates)
-        novel_path = first_existing(novel_candidates)
-
-        base_acc = extract_test_accuracy(read_text(base_path)) if base_path else None
-        novel_acc = extract_test_accuracy(read_text(novel_path)) if novel_path else None
+        base_path, base_acc = first_with_accuracy(base_candidates)
+        novel_path, novel_acc = first_with_accuracy(novel_candidates)
         hm = (
             harmonic_mean(base_acc, novel_acc)
             if base_acc is not None and novel_acc is not None
@@ -192,6 +208,15 @@ def main() -> None:
     print(f"complete datasets: {len(complete)}/{len(DATASETS)}")
     if missing:
         print("missing/incomplete: " + ", ".join(missing))
+        if args.debug:
+            print("")
+            print("debug unresolved logs:")
+            for row in rows:
+                if row["dataset"] not in missing:
+                    continue
+                print(f"- {row['dataset']}")
+                print(f"  base_log:  {row['base_log'] or 'NOT FOUND'}")
+                print(f"  novel_log: {row['novel_log'] or 'NOT FOUND'}")
 
     if args.csv is not None:
         csv_path = args.csv
