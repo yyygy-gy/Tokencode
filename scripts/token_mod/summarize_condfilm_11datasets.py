@@ -29,6 +29,14 @@ DATASETS = [
     "imagenet",
 ]
 
+# Some local/server logs use short aliases.
+DATASET_ALIASES = {
+    "stanford_cars": ["cars", "stanford-cars"],
+    "fgvc_aircraft": ["fgvc", "aircraft"],
+    "oxford_flowers": ["flowers"],
+    "oxford_pets": ["pets"],
+}
+
 TEST_ACC_RE = re.compile(
     r"Evaluate on the \*test\* set.*?^\* accuracy:\s*([0-9]+(?:\.[0-9]+)?)%",
     re.MULTILINE | re.DOTALL,
@@ -107,22 +115,30 @@ def main() -> None:
     missing = []
 
     for dataset in DATASETS:
-        common = (
-            Path(dataset)
-            / f"shots_{args.shots}"
-            / args.trainer
-            / args.cfg
-            / run_tag
-        )
-        base_candidates = [
-            train_root / common / "log.txt",
-            log_root / f"{dataset}_{run_tag}_train.out.txt",
-            log_root / f"{dataset}_{run_tag}.out.txt",
-        ]
-        novel_candidates = [
-            test_root / common / "log.txt",
-            log_root / f"{dataset}_{run_tag}_novel.out.txt",
-        ]
+        aliases = [dataset] + DATASET_ALIASES.get(dataset, [])
+        base_candidates = []
+        novel_candidates = []
+        for name in aliases:
+            common = (
+                Path(name)
+                / f"shots_{args.shots}"
+                / args.trainer
+                / args.cfg
+                / run_tag
+            )
+            base_candidates.extend(
+                [
+                    train_root / common / "log.txt",
+                    log_root / f"{name}_{run_tag}_train.out.txt",
+                    log_root / f"{name}_{run_tag}.out.txt",
+                ]
+            )
+            novel_candidates.extend(
+                [
+                    test_root / common / "log.txt",
+                    log_root / f"{name}_{run_tag}_novel.out.txt",
+                ]
+            )
 
         base_path = first_existing(base_candidates)
         novel_path = first_existing(novel_candidates)
@@ -157,16 +173,20 @@ def main() -> None:
     print(f"run_tag: {run_tag}")
     print(f"root: {root}")
     print("")
-    header = '{0:<16} {1:>8} {2:>8} {3:>8}'.format('dataset', 'base', 'novel', 'HM')
+    header = "{0:<16} {1:>8} {2:>8} {3:>8}".format("dataset", "base", "novel", "HM")
     print(header)
     print("-" * len(header))
     for row in rows:
         print(
-            '{0:<16} {1:>8} {2:>8} {3:>8}'.format(row['dataset'], fmt(row['base']), fmt(row['novel']), fmt(row['hm']))
+            "{0:<16} {1:>8} {2:>8} {3:>8}".format(
+                row["dataset"], fmt(row["base"]), fmt(row["novel"]), fmt(row["hm"])
+            )
         )
     print("-" * len(header))
     print(
-        '{0:<16} {1:>8} {2:>8} {3:>8}'.format('AVERAGE', fmt(avg_base), fmt(avg_novel), fmt(avg_hm))
+        "{0:<16} {1:>8} {2:>8} {3:>8}".format(
+            "AVERAGE", fmt(avg_base), fmt(avg_novel), fmt(avg_hm)
+        )
     )
     print("")
     print(f"complete datasets: {len(complete)}/{len(DATASETS)}")
