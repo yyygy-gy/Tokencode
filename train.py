@@ -163,9 +163,18 @@ def extend_cfg(cfg):
     cfg.TRAINER.TOKENMOD.USE_DISTILL = True
     cfg.TRAINER.TOKENMOD.RESIDUAL_GATE = True
     cfg.TRAINER.TOKENMOD.RESIDUAL_GATE_INIT = 0.1
+    # Optional FiLM post-norm: apply affine, then restore each token's original L2 norm.
+    # Zero-init still yields identity; useful for killing the harmful scale channel.
+    cfg.TRAINER.TOKENMOD.FILM_PRESERVE_NORM = False
     # Keep unconditional FiLM (global codes) as the default film path.
     # Conditional code generators are an explicit opt-in for cond-FiLM runs.
     cfg.TRAINER.TOKENMOD.USE_CONDITIONAL_CODES = False
+    # Conditional visual-code source when USE_CONDITIONAL_CODES=True:
+    # - image: sample-conditional from frozen CLIP image features
+    # - task_text: task-level from mean frozen text embeddings over candidate set Y
+    cfg.TRAINER.TOKENMOD.VISUAL_CODE_SOURCE = "image"
+    # Routing stress-test only: allow deep-text EOT to re-read class-name keys.
+    cfg.TRAINER.TOKENMOD.ALLOW_CLASS_NAME_BIAS = False
 
 
 def setup_cfg(args):

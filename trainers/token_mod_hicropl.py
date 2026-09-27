@@ -133,24 +133,51 @@ class VisualBiasGenerator(nn.Module):
         dtype = pos_embed.dtype
         code = code.to(dtype=dtype, device=pos_embed.device)
         # Keep modulator math in fp32 for stable MLP, then cast back.
-        h = self.mlp(code.float()).to(dtype=dtype)
-        a = torch.tanh(h[: self.n_head])
-        b = torch.tanh(h[self.n_head :].view(self.n_head, self.rank))
-        patch_pos = pos_embed[1:seq_len].to(dtype=dtype)
-        s = patch_pos @ self.W_pos.to(dtype=dtype)
-        patch_bias = torch.einsum("nr,hr->hn", s, b)
-        # Additive form avoids a dead zone when both a and b start at 0.
-        patch_bias = patch_bias + a.unsqueeze(-1)
-        patch_bias = self.bias_scale * patch_bias
-        bias = torch.zeros(self.n_head, seq_len, seq_len, dtype=dtype, device=pos_embed.device)
-        # Bidirectional CLS-centered modulation: CLS reads patches and patches read CLS.
-        bias[:, 0, 1:] = patch_bias
-        bias[:, 1:, 0] = patch_bias
-        return bias
+        if code.dim() == 1:
+            h = self.mlp(code.float()).to(dtype=dtype)
+            a = torch.tanh(h[: self.n_head])
+            b = torch.tanh(h[self.n_head :].view(self.n_head, self.rank))
+            patch_pos = pos_embed[1:seq_len].to(dtype=dtype)
+            s = patch_pos @ self.W_pos.to(dtype=dtype)
+            patch_bias = torch.einsum("nr,hr->hn", s, b)
+            # Additive form avoids a dead zone when both a and b start at 0.
+            patch_bias = patch_bias + a.unsqueeze(-1)
+            patch_bias = self.bias_scale * patch_bias
+            bias = torch.zeros(self.n_head, seq_len, seq_len, dtype=dtype, device=pos_embed.device)
+            # Bidirectional CLS-centered modulation: CLS reads patches and patches read CLS.
+            bias[:, 0, 1:] = patch_bias
+            bias[:, 1:, 0] = patch_bias
+            return bias
+        if code.dim() == 2:
+            # Sample-conditional codes: [B, code_len]
+            h = self.mlp(code.float()).to(dtype=dtype)
+            a = torch.tanh(h[:, : self.n_head])
+            b = torch.tanh(h[:, self.n_head :].view(code.shape[0], self.n_head, self.rank))
+            patch_pos = pos_embed[1:seq_len].to(dtype=dtype)
+            s = patch_pos @ self.W_pos.to(dtype=dtype)
+            patch_bias = torch.einsum("nr,bhr->bhn", s, b)
+            patch_bias = patch_bias + a.unsqueeze(-1)
+            patch_bias = self.bias_scale * patch_bias
+            bias = torch.zeros(
+                code.shape[0], self.n_head, seq_len, seq_len, dtype=dtype, device=pos_embed.device
+            )
+            bias[:, :, 0, 1:] = patch_bias
+            bias[:, :, 1:, 0] = patch_bias
+            return bias.reshape(code.shape[0] * self.n_head, seq_len, seq_len)
+        raise ValueError(f"Unexpected visual bias code shape: {tuple(code.shape)}")
 
 
 class TextBiasGenerator(nn.Module):
-    def __init__(self, code_len, n_head, layer_id, cross_layer, dtype=torch.float16, bias_scale=1.0):
+    def __init__(
+        self,
+        code_len,
+        n_head,
+        layer_id,
+        cross_layer,
+        dtype=torch.float16,
+        bias_scale=1.0,
+        allow_class_name_keys=False,
+    ):
         super().__init__()
         self.n_head = n_head
         self.layer_id = layer_id
@@ -158,6 +185,7 @@ class TextBiasGenerator(nn.Module):
         self.is_shallow = layer_id < cross_layer
         self.mode = "attn_bias"
         self.bias_scale = float(bias_scale)
+        self.allow_class_name_keys = bool(allow_class_name_keys)
         hidden = max(code_len, n_head * 2)
         self.mlp = nn.Sequential(
             nn.Linear(code_len, hidden, bias=True),
@@ -177,48 +205,87 @@ class TextBiasGenerator(nn.Module):
             dtype = code.dtype
         device = template_mask.device
         code = code.to(dtype=dtype, device=device)
-        head_bias = self.bias_scale * torch.tanh(self.mlp(code.float()).to(dtype=dtype))
+        if code.dim() == 1:
+            head_bias = self.bias_scale * torch.tanh(self.mlp(code.float()).to(dtype=dtype))
+            # Unconditional code is shared across classes; expand before deep-layer views.
+            head_bias = head_bias.view(1, self.n_head, 1).expand(n_cls, -1, -1).contiguous()
+        elif code.dim() == 2:
+            # Class-conditional codes: [n_cls, code_len]
+            if code.shape[0] != n_cls:
+                raise ValueError(
+                    f"Text bias expected {n_cls} class codes, got shape {tuple(code.shape)}"
+                )
+            head_bias = self.bias_scale * torch.tanh(self.mlp(code.float()).to(dtype=dtype))
+            head_bias = head_bias.view(n_cls, self.n_head, 1)
+        else:
+            raise ValueError(f"Unexpected text bias code shape: {tuple(code.shape)}")
 
         bias = torch.zeros(n_cls, self.n_head, seq_len, seq_len, dtype=dtype, device=device)
         if self.is_shallow:
             key_mask = template_mask.to(dtype=dtype)
-            bias[:, :, 0, :] = head_bias.view(1, self.n_head, 1) * key_mask.unsqueeze(1)
+            bias[:, :, 0, :] = head_bias * key_mask.unsqueeze(1)
             # Allow template tokens to feed back into SOS.
-            bias[:, :, :, 0] = bias[:, :, :, 0] + head_bias.view(1, self.n_head, 1) * key_mask.unsqueeze(1)
+            bias[:, :, :, 0] = bias[:, :, :, 0] + head_bias * key_mask.unsqueeze(1)
         else:
-            # Deep layers modulate EOT as query. Class-name columns must stay zero
-            # (unit check / no class-name modulation). Use template keys instead.
-            key_mask = template_mask.to(dtype=dtype)
+            # Deep layers modulate EOT as query. Routing stress-test can reopen
+            # class-name keys so EOT is allowed to re-read the class span.
+            if self.allow_class_name_keys:
+                key_mask = (template_mask | class_mask).to(dtype=dtype)
+            else:
+                key_mask = template_mask.to(dtype=dtype)
             rows = torch.zeros(n_cls, seq_len, dtype=dtype, device=device)
             rows.scatter_(1, eot_idx.view(n_cls, 1), 1.0)
-            eot_from_template = (
-                head_bias.view(1, self.n_head, 1, 1)
+            eot_from_keys = (
+                head_bias.view(n_cls, self.n_head, 1, 1)
                 * rows.view(n_cls, 1, seq_len, 1)
                 * key_mask.view(n_cls, 1, 1, seq_len)
             )
-            # Also allow template tokens to attend back to EOT.
-            template_to_eot = (
-                head_bias.view(1, self.n_head, 1, 1)
+            # Also allow selected keys to attend back to EOT.
+            keys_to_eot = (
+                head_bias.view(n_cls, self.n_head, 1, 1)
                 * key_mask.view(n_cls, 1, seq_len, 1)
                 * rows.view(n_cls, 1, 1, seq_len)
             )
-            bias = eot_from_template + template_to_eot
+            bias = eot_from_keys + keys_to_eot
 
-        # Hard guarantee: never put bias on class-name or padding keys.
-        bias = bias.masked_fill(class_mask.view(n_cls, 1, 1, seq_len), 0.0)
+        # Padding keys stay hard-masked. Class-name keys are optional.
+        if not self.allow_class_name_keys:
+            bias = bias.masked_fill(class_mask.view(n_cls, 1, 1, seq_len), 0.0)
         bias = bias.masked_fill(padding_mask.view(n_cls, 1, 1, seq_len), 0.0)
         return bias.reshape(n_cls * self.n_head, seq_len, seq_len)
 
 
 class VisualFiLMGenerator(nn.Module):
-    def __init__(self, code_len, width, layer_id, cross_layer, dtype=torch.float16):
+    def __init__(self, code_len, width, layer_id, cross_layer, dtype=torch.float16, preserve_norm=False):
         super().__init__()
         self.layer_id = layer_id
         self.cross_layer = cross_layer
         self.is_shallow = layer_id < cross_layer
         self.mode = "film"
+        self.preserve_norm = bool(preserve_norm)
         self.W_gamma = nn.Parameter(torch.zeros(width, code_len, dtype=dtype))
         self.W_beta = nn.Parameter(torch.zeros(width, code_len, dtype=dtype))
+
+    def _apply_affine(self, x, gamma, beta):
+        # Broadcast gamma/beta over sequence tokens: x is [T, B, C] or [C].
+        if gamma.dim() == 1:
+            y = (1.0 + gamma) * x + beta
+        else:
+            # gamma/beta: [B, C] while x tokens are [T, B, C]
+            y = (1.0 + gamma) * x + beta
+        if not self.preserve_norm:
+            return y
+        # Keep direction change, restore original token L2 norm.
+        x_norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        y_norm = y.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return y * (x_norm / y_norm)
+
+    def last_norm_stats(self, x, y):
+        with torch.no_grad():
+            return {
+                "x_mean_norm": float(x.norm(dim=-1).mean().item()),
+                "y_mean_norm": float(y.norm(dim=-1).mean().item()),
+            }
 
     def forward(self, code, x, token_masks=None, n_head=None, seq_len=None):
         dtype = x.dtype
@@ -233,24 +300,34 @@ class VisualFiLMGenerator(nn.Module):
         else:
             raise ValueError(f"Unexpected visual FiLM code shape: {tuple(code.shape)}")
         if self.is_shallow:
-            patches = (1.0 + gamma) * x[1:] + beta
+            patches = self._apply_affine(x[1:], gamma, beta)
             y = torch.cat([x[:1], patches], dim=0)
         else:
-            cls = (1.0 + gamma) * x[0] + beta
+            cls = self._apply_affine(x[0], gamma, beta)
             cls = cls.unsqueeze(0)
             y = torch.cat([cls, x[1:]], dim=0)
+        if not self.training and getattr(self, "_log_norm", False):
+            self._norm_stats = self.last_norm_stats(x, y)
         return y
 
 
 class TextFiLMGenerator(nn.Module):
-    def __init__(self, code_len, width, layer_id, cross_layer, dtype=torch.float16):
+    def __init__(self, code_len, width, layer_id, cross_layer, dtype=torch.float16, preserve_norm=False):
         super().__init__()
         self.layer_id = layer_id
         self.cross_layer = cross_layer
         self.is_shallow = layer_id < cross_layer
         self.mode = "film"
+        self.preserve_norm = bool(preserve_norm)
         self.W_gamma = nn.Parameter(torch.zeros(width, code_len, dtype=dtype))
         self.W_beta = nn.Parameter(torch.zeros(width, code_len, dtype=dtype))
+
+    def _renorm(self, x, y):
+        if not self.preserve_norm:
+            return y
+        x_norm = x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        y_norm = y.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return y * (x_norm / y_norm)
 
     def forward(self, code, x, token_masks=None, n_head=None, seq_len=None):
         dtype = x.dtype
@@ -272,6 +349,9 @@ class TextFiLMGenerator(nn.Module):
                 gamma_b = gamma.unsqueeze(0)
                 beta_b = beta.unsqueeze(0)
                 y = x * (1.0 + mask * gamma_b) + mask * beta_b
+            # Only restore norms on the modulated template tokens; others stay identical.
+            if self.preserve_norm:
+                y = torch.where(mask.bool(), self._renorm(x, y), x)
         else:
             eot_idx = token_masks["eot_idx"]
             # Scatter onto a fresh tensor so we never inplace-write a view used by autograd.
@@ -279,9 +359,10 @@ class TextFiLMGenerator(nn.Module):
             for i in range(x.shape[1]):
                 eot = int(eot_idx[i].item())
                 if gamma.dim() == 1:
-                    y[eot, i] = (1.0 + gamma) * x[eot, i] + beta
+                    y_eot = (1.0 + gamma) * x[eot, i] + beta
                 else:
-                    y[eot, i] = (1.0 + gamma[i]) * x[eot, i] + beta[i]
+                    y_eot = (1.0 + gamma[i]) * x[eot, i] + beta[i]
+                y[eot, i] = self._renorm(x[eot, i], y_eot)
         return y
 
 
@@ -343,12 +424,29 @@ class TokenModPromptLearner(nn.Module):
         print("visual_seq_len=197, text_seq_len=77")
         print(f'Frozen text template: "{prompt_prefix} <class>."')
 
-        # Conditional codes are opt-in. Default film path keeps global codes
-        # so unconditional FiLM checkpoints remain loadable.
+        # Conditional codes are opt-in. Default path keeps global codes so older
+        # unconditional checkpoints remain loadable.
         self.use_conditional_codes = bool(cfg.TRAINER.TOKENMOD.USE_CONDITIONAL_CODES)
-        if self.use_conditional_codes and self.modulation != "film":
-            raise ValueError("USE_CONDITIONAL_CODES=True currently requires MODULATION=film")
+        self.allow_class_name_bias = bool(cfg.TRAINER.TOKENMOD.ALLOW_CLASS_NAME_BIAS)
+        if self.allow_class_name_bias and self.modulation != "attn_bias":
+            raise ValueError("ALLOW_CLASS_NAME_BIAS=True currently requires MODULATION=attn_bias")
         print(f"TokenMod code mode: conditional={self.use_conditional_codes}")
+        print(f"TokenMod text bias class-name keys: allow={self.allow_class_name_bias}")
+        self.visual_code_source = str(
+            getattr(cfg.TRAINER.TOKENMOD, "VISUAL_CODE_SOURCE", "image")
+        ).lower()
+        if self.visual_code_source not in {"image", "task_text"}:
+            raise ValueError(
+                "TRAINER.TOKENMOD.VISUAL_CODE_SOURCE must be one of "
+                f"{{'image', 'task_text'}}, got {self.visual_code_source}"
+            )
+        if self.use_conditional_codes:
+            print(f"TokenMod visual code source: {self.visual_code_source}")
+        self.film_preserve_norm = bool(
+            getattr(cfg.TRAINER.TOKENMOD, "FILM_PRESERVE_NORM", False)
+        )
+        if self.modulation == "film":
+            print(f"TokenMod FiLM preserve_norm: {self.film_preserve_norm}")
         if self.use_conditional_codes:
             self.text_codes = None
             self.visual_codes = None
@@ -377,6 +475,7 @@ class TokenModPromptLearner(nn.Module):
                         self.cross_layer,
                         dtype=dtype,
                         bias_scale=self.bias_scale,
+                        allow_class_name_keys=self.allow_class_name_bias,
                     )
                     for i in range(self.prompt_depth)
                 ]
@@ -412,13 +511,27 @@ class TokenModPromptLearner(nn.Module):
         elif self.modulation == "film":
             self.text_modulators = nn.ModuleList(
                 [
-                    TextFiLMGenerator(self.code_len, ctx_dim, i, self.cross_layer, dtype=dtype)
+                    TextFiLMGenerator(
+                        self.code_len,
+                        ctx_dim,
+                        i,
+                        self.cross_layer,
+                        dtype=dtype,
+                        preserve_norm=self.film_preserve_norm,
+                    )
                     for i in range(self.prompt_depth)
                 ]
             )
             self.visual_modulators = nn.ModuleList(
                 [
-                    VisualFiLMGenerator(self.code_len, v_dim, i, self.cross_layer, dtype=dtype)
+                    VisualFiLMGenerator(
+                        self.code_len,
+                        v_dim,
+                        i,
+                        self.cross_layer,
+                        dtype=dtype,
+                        preserve_norm=self.film_preserve_norm,
+                    )
                     for i in range(self.prompt_depth)
                 ]
             )
@@ -448,10 +561,16 @@ class TokenModPromptLearner(nn.Module):
             self.visual_code_generator = ConditionalCodeGenerator(
                 feat_dim, self.code_len, self.prompt_depth, dtype=dtype
             )
-            print(
-                "TokenMod conditional codes enabled: text<-frozen class embeddings, "
-                "visual<-frozen image features"
-            )
+            if self.visual_code_source == "image":
+                print(
+                    "TokenMod conditional codes enabled: text<-frozen class embeddings, "
+                    "visual<-frozen image features"
+                )
+            else:
+                print(
+                    "TokenMod conditional codes enabled: text<-frozen class embeddings, "
+                    "visual<-mean frozen text embeddings over candidate set Y"
+                )
 
         classnames = [name.replace("_", " ") for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
@@ -544,7 +663,10 @@ class CustomCLIP(nn.Module):
         need_fixed_image = (
             self.use_residual
             or (self.training and self.use_distill)
-            or self.prompt_learner.use_conditional_codes
+            or (
+                self.prompt_learner.use_conditional_codes
+                and self.prompt_learner.visual_code_source == "image"
+            )
         )
         if need_fixed_image:
             with torch.no_grad():
@@ -557,10 +679,21 @@ class CustomCLIP(nn.Module):
             text_codes = self.prompt_learner.text_code_generator(
                 self.prompt_learner.fixed_embeddings.type(self.dtype)
             )
-            # Sample-conditional visual codes from frozen CLIP image features.
-            visual_codes = self.prompt_learner.visual_code_generator(
-                image_features_fixed.type(self.dtype)
-            )
+            if self.prompt_learner.visual_code_source == "image":
+                # Sample-conditional visual codes from frozen CLIP image features.
+                visual_codes = self.prompt_learner.visual_code_generator(
+                    image_features_fixed.type(self.dtype)
+                )
+            else:
+                # Task-level visual codes from the current candidate class table Y.
+                # All images in this split share one visual code; no GT label is used.
+                task_text = self.prompt_learner.fixed_embeddings.type(self.dtype).mean(
+                    dim=0, keepdim=True
+                )
+                visual_codes = self.prompt_learner.visual_code_generator(task_text)
+                # Expand shared task codes to the current image batch.
+                bsz = image.shape[0]
+                visual_codes = [code.expand(bsz, -1).contiguous() for code in visual_codes]
         text_features = self.text_encoder(text_emb, tokenized_prompts, text_codes, text_mods, masks)
         image_features = self.image_encoder(image.type(self.dtype), visual_codes, visual_mods)
 
